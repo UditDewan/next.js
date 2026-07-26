@@ -1,8 +1,9 @@
 import type { Socket } from 'net'
 import { mkdir, writeFile } from 'fs/promises'
+import { realpathSync } from 'fs'
 import * as inspector from 'inspector'
-import { join, extname, relative } from 'path'
-import { pathToFileURL } from 'url'
+import { join, extname, relative, isAbsolute } from 'path'
+import { fileURLToPath, pathToFileURL } from 'url'
 
 import ws from 'next/dist/compiled/ws'
 
@@ -85,6 +86,7 @@ import type { ModernSourceMapPayload } from '../lib/source-maps'
 import { isDeferredEntry } from '../../build/entries'
 import { isMetadataRouteFile } from '../../lib/metadata/is-metadata-route'
 import { setBundlerFindSourceMapImplementation } from '../patch-error-inspect'
+import { setBundlerFindSourceMapURLImplementation } from '../lib/source-maps'
 import { getNextErrorFeedbackMiddleware } from '../../next-devtools/server/get-next-error-feedback-middleware'
 import {
   formatIssue,
@@ -263,32 +265,8 @@ function setupServerHmr(
   return serverHmrSubscriptions
 }
 
-/**
- * Replaces turbopack:///[project] with the specified project in the `source` field.
- */
-function rewriteTurbopackSources(
-  projectRoot: string,
-  sourceMap: ModernSourceMapPayload
-): void {
-  if ('sections' in sourceMap) {
-    for (const section of sourceMap.sections) {
-      rewriteTurbopackSources(projectRoot, section.map)
-    }
-  } else {
-    for (let i = 0; i < sourceMap.sources.length; i++) {
-      sourceMap.sources[i] = pathToFileURL(
-        join(
-          projectRoot,
-          sourceMap.sources[i].replace(/turbopack:\/\/\/\[project\]/, '')
-        )
-      ).toString()
-    }
-  }
-}
-
 function getSourceMapFromTurbopack(
   project: Project,
-  projectRoot: string,
   sourceURL: string
 ): ModernSourceMapPayload | undefined {
   let sourceMapJson: string | null = null
@@ -300,12 +278,49 @@ function getSourceMapFromTurbopack(
   if (sourceMapJson === null) {
     return undefined
   } else {
-    const payload: ModernSourceMapPayload = JSON.parse(sourceMapJson)
-    // The sourcemap from Turbopack is not yet written to disk so its `sources`
-    // are not absolute paths yet. We need to rewrite them to be absolute paths.
-    rewriteTurbopackSources(projectRoot, payload)
-    return payload
+    return JSON.parse(sourceMapJson)
   }
+}
+
+function getSourceMapURLFromTurbopack(
+  distDir: string,
+  scriptNameOrSourceURL: string
+): string | null {
+  // React invokes this with the raw stack-frame filename, which arrives
+  // either as an absolute filesystem path or as a `file:` URL. Anything else
+  // (`file:` URLs with a query are eval'd server HMR modules carrying inline
+  // source maps, `webpack-internal://`, `node:internal/...`, `<anonymous>`,
+  // ...) is not something we have an emitted source map for.
+  let scriptPath = scriptNameOrSourceURL
+  if (scriptNameOrSourceURL.startsWith('file://')) {
+    if (scriptNameOrSourceURL.includes('?')) {
+      return null
+    }
+    try {
+      scriptPath = fileURLToPath(scriptNameOrSourceURL)
+    } catch {
+      return null
+    }
+  }
+  if (!isAbsolute(scriptPath)) {
+    return null
+  }
+
+  // Only chunks emitted into `distDir` have an on-disk source map to point at.
+  const relativePath = relative(distDir, scriptPath)
+  if (
+    relativePath.startsWith('..') ||
+    // On Windows an absolute path on a different drive is returned unchanged
+    // rather than as a `..`-prefixed relative path.
+    isAbsolute(relativePath)
+  ) {
+    return null
+  }
+
+  // The emitted source map lives next to its chunk with a `.map` suffix (see
+  // `SourceMapAsset::path`). Encode through `pathToFileURL` so any special
+  // characters in the path are escaped into a well-formed `file:` URL.
+  return pathToFileURL(scriptPath + '.map').href
 }
 
 export async function createHotReloaderTurbopack(
@@ -436,7 +451,15 @@ export async function createHotReloaderTurbopack(
     parentSpan: hotReloaderSpan,
   })
   setBundlerFindSourceMapImplementation(
-    getSourceMapFromTurbopack.bind(null, project, projectPath)
+    getSourceMapFromTurbopack.bind(null, project)
+  )
+
+  let canonicalDistDir = distDir
+  try {
+    canonicalDistDir = realpathSync(distDir)
+  } catch {}
+  setBundlerFindSourceMapURLImplementation(
+    getSourceMapURLFromTurbopack.bind(null, canonicalDistDir)
   )
 
   // Set up code frame renderer using native bindings
@@ -446,6 +469,7 @@ export async function createHotReloaderTurbopack(
 
   opts.onDevServerCleanup?.(async () => {
     setBundlerFindSourceMapImplementation(() => undefined)
+    setBundlerFindSourceMapURLImplementation(() => null)
     await project.onExit()
     await lockfile?.unlock()
   })
@@ -718,6 +742,25 @@ export async function createHotReloaderTurbopack(
         : JSON.stringify(message)
 
     client.send(data)
+  }
+
+  let updateInProgress = false
+  let pendingServerComponentChanges = false
+
+  function sendServerComponentChanges() {
+    sendHmr('server-component-changes', {
+      type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
+    })
+  }
+
+  // Each announcement makes every client refetch its page, so an update's
+  // changes are announced once, on the update's end.
+  function handleServerComponentChanges() {
+    if (updateInProgress) {
+      pendingServerComponentChanges = true
+    } else {
+      sendServerComponentChanges()
+    }
   }
 
   function sendEnqueuedMessages() {
@@ -1829,6 +1872,7 @@ export async function createHotReloaderTurbopack(
                 subscribeToChanges: subscribeToChanges
                   ? subscribeToClientChanges
                   : ((async () => {}) as StartChangeSubscription),
+                handleServerComponentChanges,
                 handleWrittenEndpoint: (id, result, forceDeleteCache) => {
                   currentWrittenEntrypoints.set(id, result)
                   assetMapper.setPathsForKey(id, result.clientPaths)
@@ -1880,6 +1924,7 @@ export async function createHotReloaderTurbopack(
     for await (const updateMessage of project.updateInfoSubscribe(30)) {
       switch (updateMessage.updateType) {
         case 'start': {
+          updateInProgress = true
           hotReloader.send({ type: HMR_MESSAGE_SENT_TO_BROWSER.BUILDING })
           // Mark that HMR has started and we need to call the callback after it settles
           // This ensures onBeforeDeferredEntries will be called again during HMR
@@ -1891,6 +1936,11 @@ export async function createHotReloaderTurbopack(
           break
         }
         case 'end': {
+          updateInProgress = false
+          if (pendingServerComponentChanges) {
+            pendingServerComponentChanges = false
+            sendServerComponentChanges()
+          }
           sendEnqueuedMessages()
 
           function addToErrorsMap(
